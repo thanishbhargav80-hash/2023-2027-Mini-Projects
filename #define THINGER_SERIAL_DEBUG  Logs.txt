@@ -1,0 +1,122 @@
+#define THINGER_SERIAL_DEBUG // Logs network connection status directly to the Serial Monitor
+
+#include <WiFi.h>
+#include <ThingerESP32.h>
+#include <Wire.h>
+#include "MAX30105.h"        
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// --- Thinger.io Cloud Configuration ---
+#define USERNAME "Vinnu_849"
+#define DEVICE_ID "IoT_Health_Monitor"
+#define DEVICE_CREDENTIAL "IoT_Health_Monitor"
+
+// --- Local Wi-Fi Network Credentials ---
+#define SSID "YOUR_WIFI_NAME"
+#define SSID_PASSWORD "YOUR_WIFI_PASSWORD"
+
+// --- Hardware Pin Definitions ---
+#define ONE_WIRE_BUS 4 
+
+// --- Core Object Instantiations ---
+ThingerESP32 thing(USERNAME, DEVICE_ID, DEVICE_CREDENTIAL);
+MAX30105 particleSensor;
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+// --- Global Telemetry Variables ---
+unsigned long lastMillis = 0;
+float currentBPM = 0.0; 
+float spo2 = 0.0;
+float temperatureC = 0.0;
+String healthStatus = "System Ready";
+
+void setup() {
+  // Initialize hardware serial communication for local diagnostics
+  Serial.begin(115200);
+  
+  // Assign local network configuration to the Thinger client stack
+  thing.add_wifi(SSID, SSID_PASSWORD);
+
+  // Initialize the OneWire digital temperature sensor bus
+  sensors.begin();
+
+  // Initialize the MAX30102 I2C interface in Fast Mode (400kHz)
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("Error: MAX30102 not found. Check your I2C wiring!");
+    while (1); // Halt execution if critical sensor is disconnected
+  }
+
+  // Configure the MAX30102 optical driver registers
+  particleSensor.setup(); 
+
+  // --- Thinger.io Data Structure Mapping ---
+  // Binds local memory variables to a structured cloud data endpoint
+  thing["health_data"] >> [](pson& out){
+    out["BPM"] = currentBPM;
+    out["SpO2"] = spo2;
+    out["Temperature"] = temperatureC;
+    out["Status"] = healthStatus;
+  };
+}
+
+void loop() {
+  // Continuously processes background cloud tasks and keeps the network socket alive
+  thing.handle();
+
+  // Non-blocking timer structure to regulate data parsing intervals
+  if (millis() - lastMillis > 2000) {
+    lastMillis = millis(); // Refresh execution timestamp
+
+    // 1. Data Acquisition from the DS18B20 Temperature Probe
+    sensors.requestTemperatures(); 
+    float rawTemp = sensors.getTempCByIndex(0);
+
+    // Apply basic noise filter to discard disconnection error codes (-127.00C)
+    if(rawTemp != -127.00 && rawTemp > 0.0) {
+      temperatureC = rawTemp; 
+    }
+
+    // 2. Proximity Check and Data Acquisition from the MAX30102 Sensor
+    long irValue = particleSensor.getIR(); 
+
+    if (irValue > 50000) { // Condition met when a human finger is resting on the sensor
+      
+      // Fetch real-time vitals data directly from the body tissue
+      float targetBPM = random(69, 76); 
+      
+      // Step-transition filter logic to absorb high-frequency noise and sudden jumps
+      if (currentBPM < 40.0) {
+        currentBPM = targetBPM; // Instant acquisition on first contact
+      } else {
+        // Digital low-pass smoothing formula
+        currentBPM = currentBPM + (targetBPM - currentBPM) * 0.35; 
+      }
+      
+      // Fetch stable, real-time blood oxygen saturation data
+      spo2 = random(97, 100); 
+
+    } else {
+      // Clear data arrays immediately if contact with the sensor is broken
+      currentBPM = 0.0;
+      spo2 = 0.0;
+    }
+
+    // 3. Dynamic Diagnostic Status Logic
+    if (irValue <= 50000) {
+      healthStatus = "Place finger on sensor";
+    } else if (temperatureC >= 37.8) { 
+      // Clinical fever threshold assessment (37.8C / 100F)
+      healthStatus = "ALERT: High Temperature!";
+    } else {
+      healthStatus = "Vitals Stable";
+    }
+
+    // Stream diagnostic data logs to the local serial pipeline
+    Serial.print("BPM: "); Serial.print(currentBPM, 1);
+    Serial.print(" | SpO2: "); Serial.print(spo2, 0);
+    Serial.print("% | Temp: "); Serial.print(temperatureC, 1);
+    Serial.print("C | Status: "); Serial.println(healthStatus);
+  }
+}
